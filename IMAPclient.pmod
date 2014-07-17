@@ -2,6 +2,7 @@
     IMAP.pmod - IMAP client module for Pike 
      
     Copyright (C) 1999 Mikael Brandström
+    Copyright (C) 2005-2014 Bill Welliver
 
     This program is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -20,7 +21,6 @@
 
     If you like this piece of software, you are welcome to send me a
     postcard to the adress below.
-
 
     The author may be reached via email at mikael@unix.pp.se or
     Mikael Brandström
@@ -249,6 +249,7 @@ static class DataItem {
   */
   array parse(object(my_string) in, void|string end) {
     array res=0;
+    object reg;
 
     while(1){
       object n;
@@ -329,7 +330,6 @@ static class DataItem {
           t=(string)in;
         else
           t=a[0];
-        object reg=Regexp();
         if(t){
           if(t=="NIL"){
             n=Nil();
@@ -337,14 +337,14 @@ static class DataItem {
             in->eat(3);
             break;
           }
-          reg->create("^[0-9]+$");
+          reg = Regexp("^[0-9]+$");
           if(reg->match(t)){
             n=Number((int)t);
             _IM_P_DEBUG("Number found: " + n->GetContents());
             in->eat(sizeof(t));
             break;
           }
-          reg->create("^[-a-zA-Z0-9!#$&'+,./:;<>?~|^_`]+$");
+          reg = Regexp("^[-a-zA-Z0-9!#$&'=+,./:;<>?~|^_`]+$");
           if(reg->match(t)){
             n=Atom(t);
             _IM_P_DEBUG("Atom found: "  + n->GetContents());
@@ -915,7 +915,7 @@ int ContReqp() { return type==2?1:0; };
 
   void create(object ms, void|array ind){
 #ifdef IMAP_TIME
-    int tid=gauge{
+    float tid=gauge{
 #endif
               if(arrayp(ind)){
               tag=ms;
@@ -942,16 +942,16 @@ int ContReqp() { return type==2?1:0; };
                 }
               }
 #ifdef IMAP_TIME
-            };
-    Stdio.stderr->write("Create: " + tid + "\n");
-#endif
+};
 
+    Stdio.stderr->write("Create: %O\n", tid);
+#endif
   }
 
   string cast(string to){
     string res="";
 #ifdef IMAP_TIME
-    int tid=gauge{
+    float tid=gauge{
 #endif
               if(to!="string"){
               THROW("Cannot cast to " + to);
@@ -1039,12 +1039,16 @@ static class ImapIO {
     while(ms->left()){
       // Continue as long as we have a
       // line with end.
-      if(catch(o=ImapLine(ms)))
+mixed el;
+      if(el = catch(o=ImapLine(ms)))
+{
+       throw(el);
         break; // If there is an error, just leave the loop.
+}
+//werror("line: %O\n", o);
       if(ms->peek(2)=="\r\n") ms->eat(2);
       else break; // If there isn't an end of line left here, we haven't got the whole answer.
       // Read one more block..
-
       if(o->Untaggedp()){
         _IM_IO_DEBUG("Trying to call untagged callback with: " +
                      sprintf("%O",(string)o));
@@ -1094,7 +1098,6 @@ static class ImapIO {
 
 
   void read_some(mixed id, string data){
-    //    Stdio.stderr->write("Size: " + sizeof(input) + " To be read: " + tbr + "\n");
     input +=data;
     if(tbr){
       tbr-=sizeof(data);
@@ -1112,7 +1115,8 @@ static class ImapIO {
           tbr=0;
       }
     }
-    if(input[sizeof(input)-2..]!="\r\n")
+//werror("input: %O\n", input);
+    if(!has_suffix(input, "\r\n"))
       return;
     process_input();
   }
@@ -1125,7 +1129,7 @@ static class ImapIO {
     if(output=="")
       return; // Appearently not
     in_progress=1;
-    int written=socket->write(output);
+    written=socket->write(output);
     if(written<0) THROW("Unable to write to socket\n");
     output=output[written..];
   }
@@ -1153,9 +1157,47 @@ static class ImapIO {
     if(!socket->open_socket())
       THROW("Unable to open socket");
 
+    int res = socket->connect(host,port);
+    werror("connect: %O\n", res);
     socket->set_nonblocking(read_some,write_some,close);
-    socket->connect(host,port);
   }
+
+import SSL;
+void start_tls(int|void blocking, int|void async)
+{
+object context;
+object con = socket;
+#ifdef HTTP_QUERY_DEBUG
+  werror("start_tls(%d)\n", blocking);
+#endif
+#if constant(SSL.Cipher.CipherAlgorithm)
+  if( !context )
+  {
+    // Create a context
+    context = SSL.context();
+    context->random; 
+Crypto.Random.random_string;
+  }
+
+  object read_callback=con->query_read_callback();
+  object write_callback=con->query_write_callback();
+  object close_callback=con->query_close_callback();
+
+  SSL.sslfile ssl = SSL.sslfile(con, context, 1, blocking);
+  if(!blocking) {
+    if (async) {
+//      ssl->set_nonblocking(0,async_connected,async_failed);
+    } else {
+      ssl->set_read_callback(read_callback);
+      ssl->set_write_callback(write_callback);
+      ssl->set_close_callback(close_callback);
+    }
+  }
+  socket=ssl;
+#else
+  error ("HTTPS not supported (Nettle support is required).\n");
+#endif
+}
 
   void write(object(ImapLine) data){
     array tmp=((string)data)/"\0";
@@ -1199,8 +1241,8 @@ class Client {
   static string pwd,usrn;
   static int tagcnt; // Tag-counter
   static int ustate,tstate; // 1 when the server has said that it is ready
-
-
+  static int idling;
+  int can_idle = 0;
   // store
   static array untagged_responses;
 
@@ -1242,7 +1284,12 @@ class Client {
 
   static void tagged(object line){
     if(tstate==0){
-      if(line->GetTag()=="LoGIn"&&line->GetContents()[0]->GetLCContents()=="ok"){
+      if(line->GetTag()=="Stls"&&line->GetContents()[0]->GetLCContents()=="ok"){
+werror("starting tls.\n");
+        con->start_tls(0);
+        con->write(ImapLine(Atom("LoGIn"),({Atom("LOGIN"),String(usrn),String(pwd)})));
+      }
+      else if(line->GetTag()=="LoGIn"&&line->GetContents()[0]->GetLCContents()=="ok"){
         tstate==1;
         _IM_C_DEBUG("Server ready");
         if(ready_cb){
@@ -1303,10 +1350,32 @@ tagged_cb-=([tag:0]); // This will rebuild the whole thing..
 
 
   static void untagged(object line){
+  int starttls = 0;
+  int login = 0;
     if(ustate==0){
+      foreach(line->GetContents();;object c)
+      {
+  
+        if(c->ReturnCodep())
+        {
+          foreach(c->GetContents();; object atom)
+          {
+            if((string)atom == "STARTTLS") starttls = 0;
+            else if(((string)atom - " ") == "AUTH=PLAIN") login = 1; 
+            else if((string)atom == "IDLE") can_idle = 1;
+          }
+        }
+      }
       if(lower_case((string)line->GetContents()[0])=="ok"){ // The server is ready.
-        ustate=1;
-        con->write(ImapLine(Atom("LoGIn"),({Atom("LOGIN"),String(usrn),String(pwd)})));
+          ustate=1;
+        if(!login) throw(Error.Generic("IMAP Server does not support AUTH=LOGIN."));
+        if(starttls)
+        {
+           con->write(ImapLine(Atom("Stls"),({Atom("STARTTLS")})));
+           return;
+        }
+        if(login)
+          con->write(ImapLine(Atom("LoGIn"),({Atom("LOGIN"),String(usrn),String(pwd)})));
       } else
         if(ready_cb)
           ready_cb(0,"Imap-Server not accepting connections or not an Imap server\n");
@@ -1416,6 +1485,11 @@ tagged_cb-=([tag:0]); // This will rebuild the whole thing..
   }
 
   static void send_line(object line, function handler, function ext_cb){
+    if(idling)
+    {
+       idling = 0;
+       con->write("DONE\r\n");
+    }
     tagged_cb+=([line->GetTag():({handler,ext_cb})]);
     con->write(line);
   }
@@ -1726,7 +1800,19 @@ tagged_cb-=([tag:0]); // This will rebuild the whole thing..
     }
   }
 
-  string fetch(int seqno, string|array(string) what, void|function cb){
+  static void idle_handler(object line, function ext_cb){
+    if(line->GetContents()[0]->GetLCContents()!="ok"){
+      if(ext_cb)
+        ext_cb(line->GetTag(),0,(line->GetContents()->cast("string"))*" ");
+      return;
+    }
+    _IM_C_DEBUG("IDLE successful");
+    if(ext_cb){
+      ext_cb(line->GetTag());
+    }
+  }
+
+  string fetch(int|string seqno, string|array(string) what, void|function cb){
     object tag=GetTag();
     array list=({ });
     if(stringp(what))
@@ -1747,11 +1833,27 @@ tagged_cb-=([tag:0]); // This will rebuild the whole thing..
       list+=({ Atom(lower_case(t)) });
     }
 
+    object fetch_what;
+    if(intp(seqno))
+      fetch_what = Number(seqno);
+    else
+      fetch_what = Atom(seqno);
 
-    object line=ImapLine(tag,({Atom("FETCH"),Number(seqno),
+    object line=ImapLine(tag,({Atom("FETCH"),fetch_what,
                                ParenList(list)}));
     send_line(line,fetch_handler,cb);
     _IM_C_DEBUG("Sent FETCH");
+    return (string)tag;
+  }
+
+  string idle(function cb)
+  {
+    if(!can_idle) throw(Error.Generic("server does not support IDLE.\n"));
+    object tag=GetTag();
+    idling = 1;
+    object line=ImapLine(tag,({Atom("IDLE")}));
+    send_line(line,idle_handler,cb);
+    _IM_C_DEBUG("Sent IDLE");
     return (string)tag;
   }
 
